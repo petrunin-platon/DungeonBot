@@ -1,0 +1,127 @@
+# navigation.py
+import time
+from config import CONFIDENCE_THRESHOLD
+from vision import (click_human, get_match_loc, get_match_info, click_point_from_info, find_and_click_bulletproof,
+                    wait_after_tap, game_frame, find_on_frame)
+from click_logic import StableTracker, DOOR_STABLE_TOL_PX, FLOOR_FLAG_WAIT_S
+import vision
+import session_log
+import session_limits
+
+# Окно выбора комнат после нажатия на дверь: (когда увидели, центр кнопки «Атаковать» в координатах окна).
+# Его берёт find_smart_door (main.py), чтобы не ждать, пока окно «успокоится», отдельной паузой (задача 10)
+ROOM_WINDOW = {"seen": None}
+
+CLAIM_WAIT_S = 8.0  # окно награды за этаж ждём столько секунд после того, как нажатие «Активировать» дошло
+
+# Цель сессии достигнута, впереди точка сохранения: остановиться, не нажимая «Активировать» (ваше решение 27.10.2026)
+CHECKPOINT_STOP = "CHECKPOINT_STOP"
+
+
+def take_room_window():
+    """Что видели после нажатия на дверь (или None) — один раз."""
+    seen, ROOM_WINDOW["seen"] = ROOM_WINDOW["seen"], None
+    return seen
+
+
+def smart_navigate_hallway(window_rect, sct, stop_at_checkpoint=False):
+    """stop_at_checkpoint — цель по времени, комнатам или титаниту достигнута: у точки сохранения вернуть CHECKPOINT_STOP
+    вместо «Активировать» и «Забрать» (награду бот заберёт при следующем запуске)."""
+    print("[НАВИГАЦИЯ] Сканирую коридор (динамическое ожидание)...")
+    wait_start = time.monotonic()
+    ROOM_WINDOW["seen"] = None
+    # Дверь жмём, только когда флажок стоит на месте
+    door = StableTracker(clock=time.monotonic, tol=DOOR_STABLE_TOL_PX * vision.GEOMETRY_CACHE.get("scale", 1.0))
+
+    while time.monotonic() - wait_start < 10.0:
+        # Один снимок на шаг (задача 11): «Атаковать», флажок и «Активировать» ищутся на одном снимке
+        shot_at = time.monotonic()
+        frame = game_frame(window_rect, sct)
+
+        # 1. Приоритет 1: Кнопка атаки (уже стоим у открытой двери).
+        # Пока флажок едет, её не ищем: без нажатия на дверь окно не откроется, а каждый поиск — лишнее время (задача 10)
+        if door.first_seen is None and find_on_frame(frame, 'btn_attack.png', 0.68):
+            return "ROOM_SELECTION"
+
+        # 2. Приоритет 2: Флаг двери (перехватывает фокус до чекпоинта)
+        flag = find_on_frame(frame, 'flag_enter.png', CONFIDENCE_THRESHOLD)
+        if flag:
+            if not door.update((flag["x"], flag["y"])):
+                time.sleep(0.05)  # флажок ещё едет — смотрим следующий снимок
+                continue
+            if door.gave_up:
+                print("[НАВИГАЦИЯ] Флажок так и не замер — жму как есть.")
+            print("[НАВИГАЦИЯ] Дверь зафиксирована. Начинаю вход...")
+            door_xy = click_point_from_info('flag_enter.png', flag, window_rect)
+            tap = click_human(door_xy[0], door_xy[1], seen_at=door.first_seen)
+
+            # Ждем окно выбора комнат. Отсчёт идёт от момента, когда нажатие дошло до телефона.
+            # Паузы 0,2 + 0,2 с «дать окну успокоиться» больше нет: find_smart_door сам проверит, что кнопки стоят на месте
+            opened = wait_after_tap('btn_attack.png', window_rect, sct, tap, 0.68)
+            if opened:
+                print("[УСПЕХ] Окно выбора комнат открылось.")
+                ROOM_WINDOW["seen"] = opened
+                return "ROOM_SELECTION"
+            else:
+                print("[ОШИБКА] Окно атаки не появилось после клика в дверь (лаги?).")
+                session_log.count("door_misses")
+                return "HALLWAY" # Возвращаемся в цикл: флажок смотрим заново, без паузы
+        door.reset()
+
+        # 3. Приоритет 3: Точка сохранения (сработает ТОЛЬКО если нет флага двери) — на том же снимке
+        checkpoint = find_on_frame(frame, 'btn_activate.png', CONFIDENCE_THRESHOLD)
+        if checkpoint and stop_at_checkpoint:
+            print("[НАВИГАЦИЯ] Этаж пройден, впереди точка сохранения. Цель достигнута — «Активировать» не нажимаю.")
+            return CHECKPOINT_STOP
+        if checkpoint:
+            print("[НАВИГАЦИЯ] Этаж пройден! Активируем точку сохранения...")
+            # Время точки сохранения считаем отдельно, в «коридор» комнаты оно не входит
+            with session_log.excluded("checkpoint"):
+                checkpoint_xy = click_point_from_info('btn_activate.png', checkpoint, window_rect)
+                tap = click_human(checkpoint_xy[0], checkpoint_xy[1], seen_at=shot_at)
+
+                print("[НАВИГАЦИЯ] Жду окно с наградой...")
+                # Без паузы «дать окну успокоиться» и повторного поиска (задача 11): пауза реакции перед «Забрать»
+                # считается от того, как окно появилось
+                claim = wait_after_tap('btn_claim.png', window_rect, sct, tap, CONFIDENCE_THRESHOLD, react_s=CLAIM_WAIT_S)
+
+                if claim:
+                    session_limits.FLOORS.claimed()  # этаж пройден: считаем по точке сохранения (задача 14)
+                    find_and_click_bulletproof('btn_claim.png', window_rect, sct, CONFIDENCE_THRESHOLD, timeout=4.0,
+                                               seen_at=claim[0])
+                    print("[НАВИГАЦИЯ] Награда забрана. Спускаемся на следующий этаж...")
+                    wait_for_new_floor(window_rect, sct)
+                    return "HALLWAY"
+                else:
+                    print("[ОШИБКА НАВИГАЦИИ] Окно с наградой так и не появилось.")
+                    return "HALLWAY"
+
+        time.sleep(0.1) # Сверхбыстрый поллинг экрана
+
+    # Бот считает, что он в коридоре, а на экране выбор команды (например, не сработало нажатие «Авто»).
+    # Раньше он в таком случае бесконечно искал дверь, теперь возвращается к выбору команды.
+    if get_match_loc('btn_auto.png', window_rect, sct, CONFIDENCE_THRESHOLD) or \
+       get_match_loc('btn_in_battle.png', window_rect, sct, CONFIDENCE_THRESHOLD):
+        print("[НАВИГАЦИЯ] Вместо коридора виден экран выбора команды. Возвращаюсь к выбору команды...")
+        return "SET_TEAM"
+
+    # Бой закончился позже, чем бот его ждал (долгая загрузка), и окно результата уже на экране.
+    # Раньше бот искал дверь под этим окном бесконечно (сессия 06, 18:01:55).
+    if get_match_loc('btn_ok.png', window_rect, sct, CONFIDENCE_THRESHOLD):
+        print("[НАВИГАЦИЯ] Вместо коридора виден экран результата боя. Перехожу к его обработке...")
+        return "WAIT_FOR_OK"
+
+    print("[НАВИГАЦИЯ] Таймаут в коридоре (10 сек). Перезапуск цикла...")
+    return "HALLWAY"
+
+def wait_for_new_floor(window_rect, sct):
+    """После награды ждём не фиксированные 4 с, а появление флажка двери на новом этаже.
+    Пока идёт спуск (~8–10 с), кнопка «Активировать» ещё видна, поэтому в коридор раньше не возвращаемся.
+    Подвижную дверь дальше отсекает проверка «флажок стоит на месте»."""
+    started = time.monotonic()
+    while time.monotonic() - started < FLOOR_FLAG_WAIT_S:
+        if get_match_info('flag_enter.png', window_rect, sct, CONFIDENCE_THRESHOLD):
+            print(f"[НАВИГАЦИЯ] На новом этаже появилась дверь через {time.monotonic() - started:.1f} с после награды.")
+            return
+        time.sleep(0.1)
+    print(f"[НАВИГАЦИЯ] Дверь на новом этаже не появилась за {FLOOR_FLAG_WAIT_S:.0f} с — продолжаю как есть.")

@@ -1,0 +1,57 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+
+# === Секреты и личные настройки ===
+.env
+gemini_keys.txt
+profile.yml
+profile.yml.bak
+story/
+
+# === Всё, что бот и окно программы пишут на ПК ===
+bot_data/
+pause.flag
+stats.json
+temp_sos.png
+temp_test.png
+rules/
+
+# === Логи и скриншоты сессий — не в git (присылаются в чат или читаются на ПК, см. CLAUDE.md) ===
+logs/
+/gui_log_*.txt
+
+# === Картинки игры — в этом репозитории их нет и не будет ===
+# Шаблоны бота и картинки титанов лежат только на ПК автора; в .exe они попадают через assets_db.py.
+assets/
+assets_db.py
+pack_assets.py
+make_backup.py
+
+# === Бинарники, архивы и сторонние утилиты ===
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+scrcpy-server
+scrcpy-noconsole.vbs
+
+# === Сборка PyInstaller ===
+build/
+dist/
+build_keep/
+*.spec
+
+# === Проверки ===
+.pytest_cache/
+
+# === OS & IDE ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
